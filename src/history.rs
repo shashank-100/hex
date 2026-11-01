@@ -374,7 +374,11 @@ impl HistoryStore {
             .collect()
     }
 
+    /// Prune on the retention worker. It rereads first: pruning a stale copy
+    /// would write back entries another process deleted and drop ones it
+    /// recorded.
     fn expire(&mut self, now_ms: u64) {
+        self.sync();
         self.prune(now_ms);
         if self.prune_pending
             && let Err(error) = self.persist()
@@ -587,6 +591,39 @@ mod tests {
         window.sync();
         assert!(window.entry(first).is_none(), "a deletion is never undone");
         assert!(window.entry(second).is_some());
+    }
+
+    #[test]
+    fn expiry_in_one_process_keeps_the_other_processes_writes() {
+        let path = temp_path("two-process-expiry");
+        let day_ms = HistoryRetention::Day.max_age_ms().unwrap();
+        let mut listener = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
+        let mut window = HistoryStore::open(path.clone(), HistoryRetention::Day, 0);
+        listener.record(draft("old"), 1_000).unwrap();
+        listener.record(draft("cleared"), 2_000).unwrap();
+
+        window.sync();
+        window.clear().unwrap();
+        listener.expire(day_ms + 1_001);
+        assert!(
+            read_snapshot(&path).unwrap().is_empty(),
+            "a clear is never undone"
+        );
+
+        listener.record(draft("old"), 3_000).unwrap();
+        window.sync();
+        listener.record(draft("new"), 4_000).unwrap();
+        window.expire(day_ms + 3_001);
+        let texts: Vec<_> = read_snapshot(&path)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.final_text)
+            .collect();
+        assert_eq!(
+            texts,
+            ["new"],
+            "another process's dictation survives expiry"
+        );
     }
 
     #[test]
